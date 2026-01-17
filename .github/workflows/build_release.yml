@@ -1,0 +1,157 @@
+name: Build & Release (cached Makefile release targets)
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ESP32
+          - release_target: release-tbeam
+            prep: prep-esp32
+          - release_target: release-tbeam_sx1262
+            prep: prep-esp32
+          - release_target: release-heltec32_v2
+            prep: prep-esp32
+          - release_target: release-heltec32_v3
+            prep: prep-esp32
+          - release_target: release-heltec32_v4
+            prep: prep-esp32
+          - release_target: release-rnode_ng_20
+            prep: prep-esp32
+          - release_target: release-rnode_ng_21
+            prep: prep-esp32
+          - release_target: release-t3s3
+            prep: prep-esp32
+          - release_target: release-tdeck
+            prep: prep-esp32
+          - release_target: release-xiao_s3
+            prep: prep-esp32
+          - release_target: release-genericesp32
+            prep: prep-esp32
+
+          # nRF52
+          - release_target: release-rak4631
+            prep: prep-nrf
+          - release_target: release-heltec_t114
+            prep: prep-nrf
+          - release_target: release-techo
+            prep: prep-nrf
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Ensure pip user bin in PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      # Cache Arduino cores/toolchains installed via arduino-cli (esp32, adafruit:nrf52, etc.)
+      - name: Cache Arduino CLI data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+          key: arduino-${{ runner.os }}-${{ matrix.prep }}-${{ hashFiles('Makefile') }}
+          restore-keys: |
+            arduino-${{ runner.os }}-${{ matrix.prep }}-
+            arduino-${{ runner.os }}-
+
+      # Cache pip downloads/wheels (helps nrfutil installs)
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('Makefile') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make python3 python3-pip zip unzip jq
+
+          # pip (user install so it benefits from cache and avoids sudo-permission issues)
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --user --upgrade adafruit-nrfutil
+
+      - name: Prep toolchains/libs
+        run: |
+          make ${{ matrix.prep }}
+
+      - name: Build release target
+        run: |
+          make ${{ matrix.release_target }}
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          if [ ! -d "Release" ]; then
+            echo "No existe ./Release. Revisa si el Makefile cambió la ruta de salida."
+            exit 1
+          fi
+
+          shopt -s nullglob
+          files=(Release/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "Release/ está vacío. No hay artifacts para subir."
+            exit 1
+          fi
+
+          for f in "${files[@]}"; do
+            base="$(basename "$f")"
+            cp -v "$f" "dist/${{ matrix.release_target }}__${base}"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.release_target }}
+          path: dist/*
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-dist
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find all-dist -type f -maxdepth 3 -print -exec cp -v {} dist/ \;
+
+          # opcional: listar
+          ls -lah dist
+
+      - name: Create/Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
